@@ -1,195 +1,243 @@
-name: Generate & Test VLESS Configs
+name: Find Valid Sub Links
 
 on:
-  workflow_dispatch:  # اجرای دستی از تب Actions
+  workflow_dispatch:
   schedule:
-    - cron: '0 */6 * * *'  # اجرای خودکار هر ۶ ساعت
+    - cron: '0 */6 * * *'
 
 env:
-  BASE_URL: "https://edge.cfgrelay.top/sub/97147ed4-4eb4-4972-be7f-5fed1310881f"
+  BASE_SUB: "https://edge.cfgrelay.top/sub/"
   OUTPUT_FILE: "result.txt"
-  THREADS: 8          # تعداد نخ‌های همزمان برای تست
-  TOTAL_GENERATE: 50  # تعداد لینک‌هایی که تولید می‌شود
+  TOTAL: "2000"
+  THREADS: "30"
+  HTTP_TIMEOUT: "6"
 
 jobs:
-  build-and-test:
+  run:
     runs-on: ubuntu-latest
     permissions:
-      contents: write   # برای کامیت کردن فایل خروجی
+      contents: write
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: Install dependencies
+      - name: Install deps
+        run: pip install aiohttp
+
+      - name: Run finder
         run: |
-          pip install requests aiohttp cloudscraper
+          cat > finder.py <<'PYEOF'
+          import os, uuid, asyncio, aiohttp, json, base64, re
 
-      - name: Generate and test VLESS links
-        id: generate
-        run: |
-          python - <<'PY'
-          import os, uuid, base64, json, random, string, asyncio, aiohttp
-          from urllib.parse import quote
+          BASE_SUB = os.environ["BASE_SUB"]
+          OUTPUT   = os.environ.get("OUTPUT_FILE", "result.txt")
+          THREADS  = int(os.environ.get("THREADS", "30"))
+          TOTAL    = int(os.environ.get("TOTAL", "2000"))
+          TIMEOUT  = float(os.environ.get("HTTP_TIMEOUT", "6"))
 
-          BASE_URL = os.getenv("BASE_URL")
-          THREADS = int(os.getenv("THREADS", "8"))
-          TOTAL = int(os.getenv("TOTAL_GENERATE", "50"))
-          OUTPUT = os.getenv("OUTPUT_FILE", "result.txt")
+          # الگوی دقیق: https://edge.cfgrelay.top/sub/{uuid v4}
+          # uuid v4 = 36 کاراکتر (8-4-4-4-12) با خط تیره
+          # کل لینک = دقیقاً مثل نمونه‌ی کاربر
+          UUID_RE = re.compile(
+              r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+          )
 
-          # استخراج بخش ثابت لینک (تا قبل از sub/)
-          fixed_part = BASE_URL.split("/sub/")[0] + "/sub/"
+          STATS = {"generated": 0, "checked": 0, "found": 0, "running": True}
 
-          # تولید UUID تصادفی
-          def rand_uuid():
+          def save_stats():
+              with open("stats.json", "w") as f:
+                  json.dump(STATS, f)
+
+          def gen_uuid():
+              # uuid4 استاندارد = 36 کاراکتر (8-4-4-4-12)
               return str(uuid.uuid4())
 
-          # تولید Public Key تصادفی (شبیه‌سازی)
-          def rand_pbk():
-              return base64.urlsafe_b64encode(os.urandom(32)).decode().rstrip("=")
+          def is_valid_sub(text: str) -> bool:
+              if not text or len(text) < 20:
+                  return False
+              t = text.strip()
+              low = t.lower()
+              for bad in ("<html", "<!doctype", "not found", "error",
+                          "invalid", "expired", "blocked", "forbidden", "unauthorized"):
+                  if bad in low:
+                      return False
+              # باید base64 معتبر باشه و شامل vless/vmess/trojan/ss باشه
+              try:
+                  padded = t + "=" * (-len(t) % 4)
+                  dec = base64.b64decode(padded, validate=False).decode("utf-8", "ignore")
+                  for proto in ("vless://", "vmess://", "trojan://", "ss://"):
+                      if proto in dec:
+                          return True
+              except Exception:
+                  pass
+              for proto in ("vless://", "vmess://", "trojan://", "ss://"):
+                  if proto in t:
+                      return True
+              return False
 
-          # تولید Short ID تصادفی
-          def rand_sid():
-              return ''.join(random.choices(string.hexdigits.lower(), k=16))
-
-          # ساخت لینک VLESS با الگوی مشابه نمونه
-          def build_vless(uuid, server, pbk, sid):
-              params = {
-                  "encryption": "none",
-                  "security": "reality",
-                  "type": "raw",
-                  "flow": "xtls-rprx-vision",
-                  "sni": server,
-                  "fp": "chrome",
-                  "pbk": pbk,
-                  "sid": sid
-              }
-              query = "&".join(f"{k}={quote(str(v))}" for k, v in params.items())
-              return f"vless://{uuid}@{server}:443?{query}"
-
-          # لیست سرورهای نمونه (قابل تغییر)
-          SERVERS = [
-              "sr1.simbank.shop", "sr16.nobird.shop", "sr8.lorvena.shop",
-              "sr9.marketandco.shop", "sr7.qevnora.site", "sr14.naxilo.fun",
-              "sr13.fixdata.shop"
-          ]
-
-          # تولید لینک‌ها
-          links = []
-          for _ in range(TOTAL):
-              uuid_val = rand_uuid()
-              server = random.choice(SERVERS)
-              pbk = rand_pbk()
-              sid = rand_sid()
-              links.append(build_vless(uuid_val, server, pbk, sid))
-
-          # تست همزمان لینک‌ها
-          async def test_link(session, link, sem):
+          async def check_one(session, sem, uuid_str, results, lock):
               async with sem:
+                  url = BASE_SUB + uuid_str
+                  STATS["checked"] += 1
                   try:
-                      # در اینجا می‌توانید تست واقعی انجام دهید
-                      # فعلاً فقط یک تأخیر شبیه‌سازی می‌کنیم
-                      await asyncio.sleep(0.1)
-                      return link  # اگر تست موفق بود
+                      async with session.get(
+                          url,
+                          timeout=aiohttp.ClientTimeout(total=TIMEOUT),
+                          headers={"User-Agent": "Mozilla/5.0"},
+                      ) as r:
+                          if r.status == 200:
+                              text = await r.text()
+                              if is_valid_sub(text):
+                                  async with lock:
+                                      results.append(url)
+                                      STATS["found"] = len(results)
+                                      with open(OUTPUT, "w", encoding="utf-8") as f:
+                                          f.write("\n".join(results))
+                                  print(f"[FOUND] {url}", flush=True)
                   except Exception:
-                      return None
+                      pass
+                  if STATS["checked"] % 25 == 0:
+                      save_stats()
 
           async def main():
+              # تولید UUIDهایی که با الگوی uuid v4 مطابقت دارن
+              uuids = []
+              while len(uuids) < TOTAL:
+                  u = gen_uuid()
+                  if UUID_RE.match(u):
+                      uuids.append(u)
+
+              STATS["generated"] = len(uuids)
+              save_stats()
+
+              results = []
+              lock = asyncio.Lock()
               sem = asyncio.Semaphore(THREADS)
-              async with aiohttp.ClientSession() as session:
-                  tasks = [test_link(session, link, sem) for link in links]
-                  results = await asyncio.gather(*tasks)
-              return [r for r in results if r]
 
-          valid_links = asyncio.run(main())
+              conn = aiohttp.TCPConnector(limit=THREADS * 2, ssl=False)
+              async with aiohttp.ClientSession(connector=conn) as session:
+                  await asyncio.gather(*[check_one(session, sem, u, results, lock) for u in uuids])
 
-          # ذخیره در فایل خروجی در ریشه ریپو
-          with open(OUTPUT, "w", encoding="utf-8") as f:
-              f.write("\n".join(valid_links))
+              with open(OUTPUT, "w", encoding="utf-8") as f:
+                  f.write("\n".join(results))
 
-          print(f"✅ {len(valid_links)} لینک معتبر تولید و در {OUTPUT} ذخیره شد.")
-          PY
+              STATS["running"] = False
+              save_stats()
+              print(f"\n[DONE] {len(results)} valid sub(s) found out of {TOTAL}")
 
-      - name: Commit output file
+          if __name__ == "__main__":
+              asyncio.run(main())
+          PYEOF
+          python finder.py
+
+      - name: Commit results
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add ${{ env.OUTPUT_FILE }}
-          git commit -m "Update generated VLESS configs [skip ci]" || echo "No changes to commit"
-          git push
+          git add ${{ env.OUTPUT_FILE }} 2>/dev/null || true
+          git commit -m "update sub links [skip ci]" || echo "no changes"
+          git push || true
 
-      # ---------- UI موقت با Cloudflare Tunnel ----------
       - name: Install cloudflared
         run: |
-          curl -L --output cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
-          sudo dpkg -i cloudflared.deb
+          curl -sL -o cf.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+          sudo dpkg -i cf.deb
 
-      - name: Start temporary UI server
+      - name: Start UI server
         run: |
-          # یک سرور ساده برای نمایش وضعیت و دکمه استارت
-          cat > ui_server.py <<'PY'
+          cat > ui.py <<'PYEOF'
           from http.server import HTTPServer, BaseHTTPRequestHandler
-          import json, os
+          import json, subprocess
 
-          class Handler(BaseHTTPRequestHandler):
+          HTML = """
+          <!DOCTYPE html><html><head><meta charset="utf-8">
+          <title>Sub Finder</title>
+          <style>
+          body{font-family:system-ui,sans-serif;background:#0e1116;color:#e6edf3;padding:30px;margin:0}
+          h1{color:#58a6ff;margin:0 0 20px}
+          .card{background:#161b22;padding:20px;border-radius:12px;margin:15px 0;border:1px solid #30363d}
+          button{background:#238636;color:#fff;border:0;padding:12px 24px;border-radius:8px;font-size:16px;cursor:pointer;font-weight:600}
+          button:hover{background:#2ea043}
+          .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin-top:15px}
+          .stat{background:#0d1117;padding:16px;border-radius:10px;border:1px solid #30363d;text-align:center}
+          .val{font-size:28px;font-weight:bold;color:#3fb950}
+          .lbl{color:#8b949e;font-size:13px;margin-top:4px}
+          pre{background:#0d1117;padding:14px;border-radius:8px;max-height:300px;overflow:auto;font-size:13px;color:#8b949e}
+          .pill{display:inline-block;padding:4px 12px;border-radius:20px;font-size:12px;background:#21262d;margin-left:10px}
+          .run{background:#1f6feb}
+          .done{background:#238636}
+          </style></head><body>
+          <h1>Sub Link Finder <span id="pill" class="pill">idle</span></h1>
+          <div class="card">
+            <button onclick="start()">Start</button>
+            <span id="msg" style="margin-left:12px;color:#8b949e"></span>
+          </div>
+          <div class="stats">
+            <div class="stat"><div class="val" id="generated">0</div><div class="lbl">UUIDs</div></div>
+            <div class="stat"><div class="val" id="checked">0</div><div class="lbl">Checked</div></div>
+            <div class="stat"><div class="val" id="found">0</div><div class="lbl">Found</div></div>
+          </div>
+          <div class="card"><pre id="log">waiting...</pre></div>
+          <script>
+          async function start(){ document.getElementById('msg').innerText='starting...'; await fetch('/start'); }
+          async function tick(){
+            try{
+              const d = await (await fetch('/stats')).json();
+              document.getElementById('generated').innerText = d.generated||0;
+              document.getElementById('checked').innerText   = d.checked||0;
+              document.getElementById('found').innerText     = d.found||0;
+              const p = document.getElementById('pill');
+              p.innerText = d.running ? 'running' : 'done';
+              p.className = 'pill ' + (d.running ? 'run' : 'done');
+              document.getElementById('log').innerText = await (await fetch('/log')).text();
+            }catch(e){}
+          }
+          setInterval(tick,1500); tick();
+          </script></body></html>
+          """
+
+          class H(BaseHTTPRequestHandler):
               def do_GET(self):
-                  if self.path == '/':
-                      self.send_response(200)
-                      self.send_header('Content-type', 'text/html')
-                      self.end_headers()
-                      html = """
-                      <!DOCTYPE html>
-                      <html>
-                      <head><title>VLESS Generator UI</title></head>
-                      <body>
-                        <h1>🚀 VLESS Config Generator</h1>
-                        <p>Status: <span id="status">Idle</span></p>
-                        <button onclick="start()">Start Generation</button>
-                        <pre id="output"></pre>
-                        <script>
-                          async function start() {
-                            document.getElementById('status').innerText = 'Running...';
-                            const res = await fetch('/start');
-                            const data = await res.text();
-                            document.getElementById('output').innerText = data;
-                            document.getElementById('status').innerText = 'Done';
-                          }
-                        </script>
-                      </body>
-                      </html>
-                      """
-                      self.wfile.write(html.encode())
-                  elif self.path == '/start':
-                      # اینجا می‌توانید لاجیک واقعی را فراخوانی کنید
-                      self.send_response(200)
-                      self.send_header('Content-type', 'text/plain')
-                      self.end_headers()
-                      self.wfile.write(b"Generation triggered (demo).")
+                  if self.path == "/":
+                      self._send(200, "text/html", HTML)
+                  elif self.path == "/stats":
+                      try: data = open("stats.json").read()
+                      except: data = "{}"
+                      self._send(200, "application/json", data)
+                  elif self.path == "/log":
+                      try: log = open("/tmp/finder.log").read()[-6000:]
+                      except: log = ""
+                      self._send(200, "text/plain; charset=utf-8", log)
+                  elif self.path == "/start":
+                      subprocess.Popen("python finder.py > /tmp/finder.log 2>&1", shell=True)
+                      self._send(200, "text/plain", "ok")
                   else:
-                      self.send_response(404)
-                      self.end_headers()
+                      self._send(404, "text/plain", "not found")
+              def _send(self, code, ct, body):
+                  self.send_response(code)
+                  self.send_header("Content-Type", ct)
+                  self.end_headers()
+                  self.wfile.write(body.encode())
+              def log_message(self,*a): pass
 
-          HTTPServer(('0.0.0.0', 8000), Handler).serve_forever()
-          PY
-          nohup python ui_server.py > /tmp/ui.log 2>&1 &
+          HTTPServer(("0.0.0.0", 8000), H).serve_forever()
+          PYEOF
+          nohup python ui.py > /tmp/ui.log 2>&1 &
+          sleep 2
 
-      - name: Expose UI via Cloudflare Tunnel
+      - name: Start Cloudflare Tunnel
         run: |
-          # تونل سریع (Quick Tunnel) بدون نیاز به حساب Cloudflare
-          nohup cloudflared tunnel --url http://localhost:8000 > /tmp/tunnel.log 2>&1 &
-          sleep 10
-          # استخراج URL از لاگ و نمایش آن
-          TUNNEL_URL=$(grep -o 'https://[^ ]*\.trycloudflare\.com' /tmp/tunnel.log | head -1)
-          echo "🌐 UI URL: $TUNNEL_URL"
-          echo "TUNNEL_URL=$TUNNEL_URL" >> $GITHUB_ENV
+          nohup cloudflared tunnel --url http://localhost:8000 > /tmp/tun.log 2>&1 &
+          sleep 12
+          URL=$(grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' /tmp/tun.log | head -1)
+          echo "TUNNEL_URL=$URL" >> $GITHUB_ENV
+          echo "### UI URL: $URL" >> $GITHUB_STEP_SUMMARY
 
-      - name: Show UI link
+      - name: Keep tunnel alive
         run: |
-          echo "### 🌐 دسترسی به UI موقت" >> $GITHUB_STEP_SUMMARY
-          echo "پس از اجرا، آدرس UI در لاگ بالا نمایش داده می‌شود." >> $GITHUB_STEP_SUMMARY
-          echo "آدرس: ${{ env.TUNNEL_URL }}" >> $GITHUB_STEP_SUMMARY
+          echo "UI is live at: ${{ env.TUNNEL_URL }}"
+          sleep 1800
