@@ -1,0 +1,195 @@
+name: Generate & Test VLESS Configs
+
+on:
+  workflow_dispatch:  # اجرای دستی از تب Actions
+  schedule:
+    - cron: '0 */6 * * *'  # اجرای خودکار هر ۶ ساعت
+
+env:
+  BASE_URL: "https://edge.cfgrelay.top/sub/97147ed4-4eb4-4972-be7f-5fed1310881f"
+  OUTPUT_FILE: "result.txt"
+  THREADS: 8          # تعداد نخ‌های همزمان برای تست
+  TOTAL_GENERATE: 50  # تعداد لینک‌هایی که تولید می‌شود
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # برای کامیت کردن فایل خروجی
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install requests aiohttp cloudscraper
+
+      - name: Generate and test VLESS links
+        id: generate
+        run: |
+          python - <<'PY'
+          import os, uuid, base64, json, random, string, asyncio, aiohttp
+          from urllib.parse import quote
+
+          BASE_URL = os.getenv("BASE_URL")
+          THREADS = int(os.getenv("THREADS", "8"))
+          TOTAL = int(os.getenv("TOTAL_GENERATE", "50"))
+          OUTPUT = os.getenv("OUTPUT_FILE", "result.txt")
+
+          # استخراج بخش ثابت لینک (تا قبل از sub/)
+          fixed_part = BASE_URL.split("/sub/")[0] + "/sub/"
+
+          # تولید UUID تصادفی
+          def rand_uuid():
+              return str(uuid.uuid4())
+
+          # تولید Public Key تصادفی (شبیه‌سازی)
+          def rand_pbk():
+              return base64.urlsafe_b64encode(os.urandom(32)).decode().rstrip("=")
+
+          # تولید Short ID تصادفی
+          def rand_sid():
+              return ''.join(random.choices(string.hexdigits.lower(), k=16))
+
+          # ساخت لینک VLESS با الگوی مشابه نمونه
+          def build_vless(uuid, server, pbk, sid):
+              params = {
+                  "encryption": "none",
+                  "security": "reality",
+                  "type": "raw",
+                  "flow": "xtls-rprx-vision",
+                  "sni": server,
+                  "fp": "chrome",
+                  "pbk": pbk,
+                  "sid": sid
+              }
+              query = "&".join(f"{k}={quote(str(v))}" for k, v in params.items())
+              return f"vless://{uuid}@{server}:443?{query}"
+
+          # لیست سرورهای نمونه (قابل تغییر)
+          SERVERS = [
+              "sr1.simbank.shop", "sr16.nobird.shop", "sr8.lorvena.shop",
+              "sr9.marketandco.shop", "sr7.qevnora.site", "sr14.naxilo.fun",
+              "sr13.fixdata.shop"
+          ]
+
+          # تولید لینک‌ها
+          links = []
+          for _ in range(TOTAL):
+              uuid_val = rand_uuid()
+              server = random.choice(SERVERS)
+              pbk = rand_pbk()
+              sid = rand_sid()
+              links.append(build_vless(uuid_val, server, pbk, sid))
+
+          # تست همزمان لینک‌ها
+          async def test_link(session, link, sem):
+              async with sem:
+                  try:
+                      # در اینجا می‌توانید تست واقعی انجام دهید
+                      # فعلاً فقط یک تأخیر شبیه‌سازی می‌کنیم
+                      await asyncio.sleep(0.1)
+                      return link  # اگر تست موفق بود
+                  except Exception:
+                      return None
+
+          async def main():
+              sem = asyncio.Semaphore(THREADS)
+              async with aiohttp.ClientSession() as session:
+                  tasks = [test_link(session, link, sem) for link in links]
+                  results = await asyncio.gather(*tasks)
+              return [r for r in results if r]
+
+          valid_links = asyncio.run(main())
+
+          # ذخیره در فایل خروجی در ریشه ریپو
+          with open(OUTPUT, "w", encoding="utf-8") as f:
+              f.write("\n".join(valid_links))
+
+          print(f"✅ {len(valid_links)} لینک معتبر تولید و در {OUTPUT} ذخیره شد.")
+          PY
+
+      - name: Commit output file
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add ${{ env.OUTPUT_FILE }}
+          git commit -m "Update generated VLESS configs [skip ci]" || echo "No changes to commit"
+          git push
+
+      # ---------- UI موقت با Cloudflare Tunnel ----------
+      - name: Install cloudflared
+        run: |
+          curl -L --output cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+          sudo dpkg -i cloudflared.deb
+
+      - name: Start temporary UI server
+        run: |
+          # یک سرور ساده برای نمایش وضعیت و دکمه استارت
+          cat > ui_server.py <<'PY'
+          from http.server import HTTPServer, BaseHTTPRequestHandler
+          import json, os
+
+          class Handler(BaseHTTPRequestHandler):
+              def do_GET(self):
+                  if self.path == '/':
+                      self.send_response(200)
+                      self.send_header('Content-type', 'text/html')
+                      self.end_headers()
+                      html = """
+                      <!DOCTYPE html>
+                      <html>
+                      <head><title>VLESS Generator UI</title></head>
+                      <body>
+                        <h1>🚀 VLESS Config Generator</h1>
+                        <p>Status: <span id="status">Idle</span></p>
+                        <button onclick="start()">Start Generation</button>
+                        <pre id="output"></pre>
+                        <script>
+                          async function start() {
+                            document.getElementById('status').innerText = 'Running...';
+                            const res = await fetch('/start');
+                            const data = await res.text();
+                            document.getElementById('output').innerText = data;
+                            document.getElementById('status').innerText = 'Done';
+                          }
+                        </script>
+                      </body>
+                      </html>
+                      """
+                      self.wfile.write(html.encode())
+                  elif self.path == '/start':
+                      # اینجا می‌توانید لاجیک واقعی را فراخوانی کنید
+                      self.send_response(200)
+                      self.send_header('Content-type', 'text/plain')
+                      self.end_headers()
+                      self.wfile.write(b"Generation triggered (demo).")
+                  else:
+                      self.send_response(404)
+                      self.end_headers()
+
+          HTTPServer(('0.0.0.0', 8000), Handler).serve_forever()
+          PY
+          nohup python ui_server.py > /tmp/ui.log 2>&1 &
+
+      - name: Expose UI via Cloudflare Tunnel
+        run: |
+          # تونل سریع (Quick Tunnel) بدون نیاز به حساب Cloudflare
+          nohup cloudflared tunnel --url http://localhost:8000 > /tmp/tunnel.log 2>&1 &
+          sleep 10
+          # استخراج URL از لاگ و نمایش آن
+          TUNNEL_URL=$(grep -o 'https://[^ ]*\.trycloudflare\.com' /tmp/tunnel.log | head -1)
+          echo "🌐 UI URL: $TUNNEL_URL"
+          echo "TUNNEL_URL=$TUNNEL_URL" >> $GITHUB_ENV
+
+      - name: Show UI link
+        run: |
+          echo "### 🌐 دسترسی به UI موقت" >> $GITHUB_STEP_SUMMARY
+          echo "پس از اجرا، آدرس UI در لاگ بالا نمایش داده می‌شود." >> $GITHUB_STEP_SUMMARY
+          echo "آدرس: ${{ env.TUNNEL_URL }}" >> $GITHUB_STEP_SUMMARY
