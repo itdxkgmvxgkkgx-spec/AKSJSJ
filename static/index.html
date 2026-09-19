@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html lang="fa" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>VLESS Forge — تولید و تست کانفیگ</title>
+<meta name="theme-color" content="#0a0a14">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Vazirmatn:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@6.5.1/css/all.min.css" rel="stylesheet">
+<link href="/static/app.css" rel="stylesheet">
+</head>
+<body>
+<div id="bg" aria-hidden="true">
+  <div class="orb orb-a"></div><div class="orb orb-b"></div><div class="orb orb-c"></div>
+  <div class="grid"></div>
+</div>
+
+<header id="topbar">
+  <div class="brand">
+    <div class="logo"><i class="fa-solid fa-bolt"></i></div>
+    <div>
+      <h1>VLESS <span>Forge</span></h1>
+      <p>تولید، تست و رتبه‌بندی کانفیگ‌های VLESS با سرعت بالا</p>
+    </div>
+  </div>
+  <div class="top-actions">
+    <div id="phase-pill" class="pill idle"><span class="dot"></span><span id="phase-text">آماده</span></div>
+    <button id="btn-theme" class="icon-btn" title="تم"><i class="fa-solid fa-circle-half-stroke"></i></button>
+  </div>
+</header>
+
+<main id="app">
+  <!-- Control panel -->
+  <section id="control" class="card control">
+    <div class="control-row">
+      <label class="field">
+        <span><i class="fa-solid fa-layer-group"></i> تعداد تولید</span>
+        <input id="opt-total" type="number" min="1" max="2000" value="50">
+      </label>
+      <label class="field">
+        <span><i class="fa-solid fa-microchip"></i> نخ همزمان</span>
+        <input id="opt-threads" type="number" min="1" max="256" value="32">
+      </label>
+      <label class="field">
+        <span><i class="fa-solid fa-vial"></i> حالت تست</span>
+        <select id="opt-mode">
+          <option value="auto">Auto (Xray اگر بود)</option>
+          <option value="tls" selected>TLS Handshake</option>
+          <option value="tcp">TCP فقط</option>
+          <option value="xray">Xray واقعی</option>
+        </select>
+      </label>
+      <label class="field">
+        <span><i class="fa-solid fa-rotate"></i> تکرار</span>
+        <input id="opt-rounds" type="number" min="1" max="10" value="2">
+      </label>
+      <label class="field">
+        <span><i class="fa-solid fa-stopwatch"></i> تایم‌اوت (s)</span>
+        <input id="opt-timeout" type="number" min="1" max="60" step="0.5" value="6">
+      </label>
+      <div class="control-buttons">
+        <button id="btn-start" class="btn primary"><i class="fa-solid fa-play"></i><span>شروع تولید</span></button>
+        <button id="btn-stop" class="btn danger" disabled><i class="fa-solid fa-stop"></i></button>
+      </div>
+    </div>
+
+    <div class="progress-wrap">
+      <div class="progress-meta">
+        <span id="progress-msg">در انتظار شروع…</span>
+        <span id="progress-eta"></span>
+      </div>
+      <div class="progress"><div id="progress-bar"></div><div class="shine"></div></div>
+    </div>
+  </section>
+
+  <!-- Stats -->
+  <section id="stats" class="stats">
+    <article class="card stat"><i class="fa-solid fa-cubes"></i><div><b id="st-total">0</b><span>تولید شده</span></div></article>
+    <article class="card stat ok"><i class="fa-solid fa-circle-check"></i><div><b id="st-working">0</b><span>سالم</span></div></article>
+    <article class="card stat bad"><i class="fa-solid fa-circle-xmark"></i><div><b id="st-failed">0</b><span>ناموفق</span></div></article>
+    <article class="card stat fast"><i class="fa-solid fa-gauge-high"></i><div><b id="st-best">—</b><span>بهترین پینگ</span></div></article>
+    <article class="card stat"><i class="fa-solid fa-server"></i><div><b id="st-source">0</b><span>سرور منبع</span></div></article>
+    <article class="card stat"><i class="fa-solid fa-clock"></i><div><b id="st-time">—</b><span>مدت اجرا</span></div></article>
+  </section>
+
+  <!-- Subscription info -->
+  <section id="userinfo" class="card userinfo hidden">
+    <div class="ui-head"><i class="fa-solid fa-id-card"></i> اطلاعات اشتراک <b id="ui-title"></b></div>
+    <div class="ui-body">
+      <div class="ui-bar"><div id="ui-bar-fill"></div></div>
+      <div class="ui-row">
+        <span><i class="fa-solid fa-download"></i> مصرف: <b id="ui-used">—</b></span>
+        <span><i class="fa-solid fa-database"></i> کل: <b id="ui-total">—</b></span>
+        <span><i class="fa-solid fa-hourglass-half"></i> انقضا: <b id="ui-expire">—</b></span>
+      </div>
+    </div>
+  </section>
+
+  <!-- Results -->
+  <section id="results" class="card results">
+    <div class="results-head">
+      <h2><i class="fa-solid fa-list-check"></i> نتایج</h2>
+      <div class="results-tools">
+        <div class="search"><i class="fa-solid fa-magnifying-glass"></i><input id="search" placeholder="جستجو: هاست، IP، fingerprint…"></div>
+        <div class="seg">
+          <button data-filter="all" class="active">همه</button>
+          <button data-filter="ok">سالم</button>
+          <button data-filter="bad">ناموفق</button>
+        </div>
+        <button id="btn-copy-all" class="btn ghost"><i class="fa-regular fa-copy"></i> کپی همه سالم</button>
+        <div class="dropdown">
+          <button class="btn ghost"><i class="fa-solid fa-download"></i> دانلود <i class="fa-solid fa-chevron-down small"></i></button>
+          <div class="menu">
+            <a href="/download/result.txt">result.txt (لینک‌ها)</a>
+            <a href="/download/result_b64.txt">result_b64.txt (سابسکریپشن)</a>
+            <a href="/download/result.json">result.json (کامل)</a>
+            <a href="/download/all_generated.txt">all_generated.txt</a>
+          </div>
+        </div>
+        <button id="btn-sub-qr" class="btn ghost"><i class="fa-solid fa-qrcode"></i> QR اشتراک</button>
+      </div>
+    </div>
+
+    <div class="sub-link">
+      <i class="fa-solid fa-link"></i>
+      <span>لینک اشتراک:</span>
+      <code id="sub-url">…</code>
+      <button class="icon-btn" id="btn-copy-sub" title="کپی"><i class="fa-regular fa-copy"></i></button>
+    </div>
+
+    <div class="table-wrap">
+      <table id="tbl">
+        <thead>
+          <tr>
+            <th data-sort="rank">#</th>
+            <th data-sort="ok">وضعیت</th>
+            <th data-sort="latency_ms" class="sorted">پینگ</th>
+            <th>سرور</th>
+            <th data-sort="address">آدرس</th>
+            <th data-sort="fp">FP</th>
+            <th>SNI</th>
+            <th>امنیت</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody id="tbody"><tr><td colspan="9" class="empty"><i class="fa-solid fa-satellite-dish"></i><p>هنوز نتیجه‌ای نیست. روی «شروع تولید» بزن.</p></td></tr></tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- Log -->
+  <section id="logs" class="card logs">
+    <div class="log-head">
+      <h2><i class="fa-solid fa-terminal"></i> لاگ زنده</h2>
+      <label class="switch"><input id="autoscroll" type="checkbox" checked><span></span> اسکرول خودکار</label>
+    </div>
+    <pre id="log" dir="ltr"></pre>
+  </section>
+</main>
+
+<footer id="footer">
+  <span>VLESS Forge v2 · ساخته شده با Python stdlib · بدون دیتابیس</span>
+  <span id="last-run"></span>
+</footer>
+
+<!-- QR modal -->
+<div id="modal" class="modal hidden" role="dialog">
+  <div class="modal-box">
+    <button class="icon-btn close" id="modal-close"><i class="fa-solid fa-xmark"></i></button>
+    <h3 id="modal-title">QR Code</h3>
+    <div id="qr"></div>
+    <code id="modal-link" dir="ltr"></code>
+    <button class="btn primary" id="modal-copy"><i class="fa-regular fa-copy"></i> کپی لینک</button>
+  </div>
+</div>
+
+<div id="toast"></div>
+
+<script src="https://cdn.jsdelivr.net/npm/qrcode-generator@1.4.4/qrcode.min.js"></script>
+<script src="/static/app.js"></script>
+</body>
+</html>

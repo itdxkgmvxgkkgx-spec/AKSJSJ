@@ -1,0 +1,216 @@
+name: Generate & Test VLESS Configs
+
+on:
+  workflow_dispatch:  # اجرای دستی از تب Actions
+    inputs:
+      total:
+        description: 'تعداد کانفیگ تولیدی'
+        default: '50'
+        required: false
+      threads:
+        description: 'تعداد نخ همزمان'
+        default: '32'
+        required: false
+      test_mode:
+        description: 'حالت تست (auto = Xray واقعی اگر موجود بود)'
+        type: choice
+        default: 'auto'
+        options: [auto, xray, tls, tcp]
+      ui_minutes:
+        description: 'چند دقیقه UI موقت (Cloudflare Tunnel) زنده بماند (0 = بدون UI)'
+        default: '20'
+        required: false
+  schedule:
+    - cron: '0 */6 * * *'  # اجرای خودکار هر ۶ ساعت
+
+env:
+  BASE_URL: "https://edge.cfgrelay.top/sub/97147ed4-4eb4-4972-be7f-5fed1310881f"
+  OUTPUT_FILE: "result.txt"
+  THREADS: ${{ github.event.inputs.threads || '32' }}          # تعداد نخ‌های همزمان برای تست
+  TOTAL_GENERATE: ${{ github.event.inputs.total || '50' }}     # تعداد لینک‌هایی که تولید می‌شود
+  TEST_MODE: ${{ github.event.inputs.test_mode || 'auto' }}
+  ROUNDS: 2
+  TIMEOUT: 6
+  UI_MINUTES: ${{ github.event.inputs.ui_minutes || '0' }}     # اجرای زمان‌بندی‌شده: بدون UI
+  OUT_DIR: out
+
+concurrency:
+  group: vless-generate
+  cancel-in-progress: false
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write   # برای کامیت کردن فایل خروجی
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+
+      - name: Install Xray-core (real connectivity test)
+        run: |
+          set -e
+          mkdir -p /tmp/xray && cd /tmp/xray
+          curl -sL --retry 3 -o xray.zip https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip
+          unzip -oq xray.zip
+          sudo install -m 755 xray /usr/local/bin/xray
+          xray version | head -1
+
+      - name: Generate and test VLESS links
+        id: generate
+        run: |
+          set -o pipefail
+          mkdir -p "$OUT_DIR"
+          python generator.py 2>&1 | tee "$OUT_DIR/generator.log"
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, os
+          d = json.load(open(os.path.join(os.environ["OUT_DIR"], "result.json")))
+          s = d["summary"]
+          print(f"working={s['working']}")
+          print(f"generated={s['generated']}")
+          print(f"best_ms={s.get('best_ms')}")
+          print(f"avg_ms={s.get('avg_ms')}")
+          print(f"mode={d['meta']['mode']}")
+          print(f"duration={d['meta']['duration_sec']}")
+          PY
+
+      - name: Publish results to repo root
+        run: |
+          cp "$OUT_DIR/$OUTPUT_FILE" ./"$OUTPUT_FILE"
+          cp "$OUT_DIR/result_b64.txt" ./result_b64.txt
+          cp "$OUT_DIR/result.json" ./result.json
+          cp "$OUT_DIR/all_generated.txt" ./all_generated.txt
+          echo "Working links: $(wc -l < "$OUTPUT_FILE")"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: vless-results-${{ github.run_number }}
+          path: |
+            result.txt
+            result_b64.txt
+            result.json
+            all_generated.txt
+            out/generator.log
+          retention-days: 14
+
+      - name: Commit & push results
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add result.txt result_b64.txt result.json all_generated.txt
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "chore: update VLESS results (${{ steps.generate.outputs.working }}/${{ steps.generate.outputs.generated }} working, best ${{ steps.generate.outputs.best_ms }} ms) [skip ci]"
+            git pull --rebase origin ${{ github.ref_name }} || true
+            git push origin HEAD:${{ github.ref_name }}
+          fi
+
+      - name: Job summary
+        env:
+          REPO: ${{ github.repository }}
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          RAW="https://raw.githubusercontent.com/$REPO/$BRANCH"
+          {
+            echo "## ⚡ VLESS Forge — نتیجه اجرا"
+            echo ""
+            echo "| مورد | مقدار |"
+            echo "|---|---|"
+            echo "| تولید شده | ${{ steps.generate.outputs.generated }} |"
+            echo "| سالم | **${{ steps.generate.outputs.working }}** |"
+            echo "| بهترین پینگ | ${{ steps.generate.outputs.best_ms }} ms |"
+            echo "| میانگین پینگ | ${{ steps.generate.outputs.avg_ms }} ms |"
+            echo "| حالت تست | ${{ steps.generate.outputs.mode }} |"
+            echo "| مدت | ${{ steps.generate.outputs.duration }} s |"
+            echo ""
+            echo "### 🔗 لینک اشتراک (همیشه آخرین نسخه)"
+            echo '```'
+            echo "$RAW/result_b64.txt"
+            echo '```'
+            echo "لینک‌های خام: $RAW/result.txt  ·  JSON: $RAW/result.json"
+            echo ""
+            echo "### 🏆 ۱۰ کانفیگ برتر"
+            echo '```'
+            head -10 result.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Install cloudflared
+        if: env.UI_MINUTES != '0'
+        run: |
+          curl -sL --retry 3 -o /tmp/cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+          sudo install -m 755 /tmp/cloudflared /usr/local/bin/cloudflared
+          cloudflared --version
+
+      - name: Start UI server + Cloudflare Quick Tunnel
+        if: env.UI_MINUTES != '0'
+        id: tunnel
+        run: |
+          # UI server (serves results from OUT_DIR, can re-run generator from the browser)
+          UI_PORT=8000 OUT_DIR="$PWD/$OUT_DIR" nohup python ui_server.py > /tmp/ui.log 2>&1 &
+          for i in $(seq 1 20); do curl -sf http://localhost:8000/health >/dev/null && break; sleep 0.5; done
+          curl -s http://localhost:8000/health
+
+          # تونل سریع (Quick Tunnel) بدون نیاز به حساب Cloudflare
+          nohup cloudflared tunnel --no-autoupdate --url http://localhost:8000 > /tmp/tunnel.log 2>&1 &
+          TUNNEL_URL=""
+          for i in $(seq 1 40); do
+            TUNNEL_URL=$(grep -oE 'https://[a-zA-Z0-9.-]+\.trycloudflare\.com' /tmp/tunnel.log | head -1)
+            [ -n "$TUNNEL_URL" ] && break
+            sleep 1
+          done
+          if [ -z "$TUNNEL_URL" ]; then
+            echo "::warning::Tunnel URL not found"; cat /tmp/tunnel.log; exit 0
+          fi
+          echo "🌐 UI URL: $TUNNEL_URL"
+          echo "TUNNEL_URL=$TUNNEL_URL" >> "$GITHUB_ENV"
+          echo "url=$TUNNEL_URL" >> "$GITHUB_OUTPUT"
+          echo "::notice title=🌐 VLESS Forge UI::$TUNNEL_URL  (live for $UI_MINUTES min)"
+
+      - name: Show UI link
+        if: env.UI_MINUTES != '0'
+        run: |
+          {
+            echo ""
+            echo "### 🌐 دسترسی به UI موقت"
+            if [ -n "${TUNNEL_URL:-}" ]; then
+              echo "**آدرس:** $TUNNEL_URL"
+              echo ""
+              echo "- سابسکریپشن زنده: \`$TUNNEL_URL/sub/b64\`"
+              echo "- این آدرس تا **$UI_MINUTES دقیقه** (تا پایان همین Job) زنده است."
+            else
+              echo "⚠️ تونل ساخته نشد. لاگ را در استپ قبلی ببینید."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Keep UI alive
+        if: env.UI_MINUTES != '0' && env.TUNNEL_URL != ''
+        run: |
+          echo "UI live at $TUNNEL_URL for $UI_MINUTES minutes. Cancel the run to stop early."
+          END=$(( $(date +%s) + UI_MINUTES*60 ))
+          while [ "$(date +%s)" -lt "$END" ]; do
+            LEFT=$(( (END - $(date +%s)) / 60 ))
+            echo "[$(date +%H:%M:%S)] alive — ~${LEFT} min left — $TUNNEL_URL"
+            sleep 60
+          done
+          # sync any results regenerated from the UI back into the repo
+          if [ -f "$OUT_DIR/result.txt" ] && ! cmp -s "$OUT_DIR/result.txt" result.txt; then
+            cp "$OUT_DIR"/{result.txt,result_b64.txt,result.json,all_generated.txt} . 2>/dev/null || true
+            git add result.txt result_b64.txt result.json all_generated.txt
+            git commit -m "chore: update VLESS results from UI session [skip ci]" && git push origin HEAD:${{ github.ref_name }} || true
+          fi
